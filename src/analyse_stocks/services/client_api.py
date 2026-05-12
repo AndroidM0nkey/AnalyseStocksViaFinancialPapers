@@ -1,17 +1,14 @@
 from __future__ import annotations
 
-import json
 import logging
-import re
 import uuid
 from typing import Any
 
 import clickhouse_connect
 import grpc
-import httpx
-from google.protobuf.struct_pb2 import Struct
-from redis.asyncio import from_url as redis_from_url
 from clickhouse_connect.driver.exceptions import ClickHouseError
+from google.protobuf.json_format import MessageToDict
+from redis.asyncio import from_url as redis_from_url
 
 import analysis_pb2
 import analysis_pb2_grpc
@@ -20,196 +17,70 @@ from analyse_stocks.common.grpc_helpers import create_server, enable_reflection,
 from analyse_stocks.common.logging import configure_logging
 
 
-def _extract_json(text: str) -> dict[str, Any] | None:
-    match = re.search(r"\{.*\}", text, flags=re.DOTALL)
-    if not match:
-        return None
-    try:
-        return json.loads(match.group(0))
-    except json.JSONDecodeError:
-        return None
-
-
-def _parse_float(value: str) -> float | None:
-    if not value:
-        return None
-    normalized = value.replace(" ", "").replace(",", ".")
-    match = re.search(r"-?\d+(?:\.\d+)?", normalized)
-    if not match:
-        return None
-    try:
-        return float(match.group(0))
-    except ValueError:
-        return None
-
-
-def _build_kpi_dict(kpis: list[analysis_pb2.NormalizedKpi]) -> dict[str, float]:
-    result: dict[str, float] = {}
-    for item in kpis:
-        if item.canonical_kpi and item.canonical_kpi not in result:
-            result[item.canonical_kpi] = item.value
-    return result
-
-
-def _safe_div(a: float | None, b: float | None) -> float | None:
-    if a is None or b is None or b == 0:
-        return None
-    return a / b
-
-
-def _compute_derived_metrics(kpis: dict[str, float]) -> dict[str, float]:
-    revenue = kpis.get("revenue")
-    ebitda = kpis.get("ebitda")
-    net_income = kpis.get("net_income")
-    debt = kpis.get("debt")
-    equity = kpis.get("equity")
-    cash = kpis.get("cash")
-    operating_income = kpis.get("operating_income")
-
-    derived = {
-        "ebitda_margin": _safe_div(ebitda, revenue),
-        "net_margin": _safe_div(net_income, revenue),
-        "operating_margin": _safe_div(operating_income, revenue),
-        "debt_to_equity": _safe_div(debt, equity),
-        "cash_to_debt": _safe_div(cash, debt),
-    }
-    return {key: value for key, value in derived.items() if value is not None}
-
-
-def _build_analytical_report_prompt(report_input: dict[str, Any]) -> str:
-    return f"""
-You are a senior equity research analyst.
-
-Your task is to prepare a concise analytical report based ONLY on the structured KPI data below.
-Do not use outside knowledge.
-Do not invent missing facts.
-If the data is mixed or insufficient, say so explicitly.
-Write the analytical report in Russian.
-
-Company: {report_input.get("company")}
-Ticker: {report_input.get("ticker")}
-Event date: {report_input.get("event_date")}
-Filing type: {report_input.get("filing_type")}
-Fiscal period: {report_input.get("fiscal_period")}
-Currency: {report_input.get("currency")}
-
-Normalized KPIs:
-{json.dumps(report_input.get("normalized_kpis", {}), ensure_ascii=False, indent=2)}
-
-Derived metrics:
-{json.dumps(report_input.get("derived_metrics", {}), ensure_ascii=False, indent=2)}
-
-Write the output as valid JSON only with the following schema:
-{{
-  "executive_summary": "string",
-  "positive_factors": ["string", "string"],
-  "risk_factors": ["string", "string"],
-  "financial_health_assessment": "string",
-  "profitability_assessment": "string",
-  "leverage_assessment": "string",
-  "investment_view": {{
-    "signal": "strong_buy | buy | hold | sell | strong_sell",
-    "confidence": 0.0,
-    "expected_short_term_reaction": "string",
-    "rationale": "string"
-  }},
-  "key_kpi_interpretation": [
-    {{
-      "kpi": "string",
-      "interpretation": "string"
-    }}
-  ]
-}}
-""".strip()
-
-
-def _build_market_decision_prompt(report_input: dict[str, Any]) -> str:
-    return f"""
-You are a senior equity research analyst.
-
-Your task is to produce ONLY a compact market decision based ONLY on the KPI data below.
-Do not use outside knowledge.
-Do not invent missing facts.
-If the data is mixed or insufficient, prefer a neutral signal.
-Write the output in Russian.
-
-Company: {report_input.get("company")}
-Ticker: {report_input.get("ticker")}
-Event date: {report_input.get("event_date")}
-Filing type: {report_input.get("filing_type")}
-Fiscal period: {report_input.get("fiscal_period")}
-Currency: {report_input.get("currency")}
-
-Normalized KPIs:
-{json.dumps(report_input.get("normalized_kpis", {}), ensure_ascii=False, indent=2)}
-
-Derived metrics:
-{json.dumps(report_input.get("derived_metrics", {}), ensure_ascii=False, indent=2)}
-
-Return valid JSON only with this schema:
-{{
-  "signal": "strong_buy | buy | hold | sell | strong_sell",
-  "confidence": 0.0,
-  "expected_move": "string",
-  "rationale": "string"
-}}
-""".strip()
-
-
-def _render_report_markdown(report: dict[str, Any]) -> str:
+def _render_report_markdown(report: dict[str, Any], raw_response: str = "") -> str:
     if not report:
+        if raw_response.strip():
+            return "\n".join(
+                [
+                    "Не удалось распарсить JSON-ответ модели.",
+                    "",
+                    "```text",
+                    raw_response.strip(),
+                    "```",
+                ]
+            )
         return "Не удалось распарсить JSON-ответ модели."
 
-    investment_view = report.get("investment_view", {})
-    lines = [
-        "# Аналитический отчет",
-        "",
-        "## Executive Summary",
-        report.get("executive_summary", ""),
-        "",
-        "## Positive Factors",
-    ]
-    lines.extend(f"- {item}" for item in report.get("positive_factors", []))
-    lines.extend(
-        [
-            "",
-            "## Risk Factors",
-        ]
-    )
-    lines.extend(f"- {item}" for item in report.get("risk_factors", []))
-    lines.extend(
-        [
-            "",
-            "## Financial Health Assessment",
-            report.get("financial_health_assessment", ""),
-            "",
-            "## Profitability Assessment",
-            report.get("profitability_assessment", ""),
-            "",
-            "## Leverage Assessment",
-            report.get("leverage_assessment", ""),
-            "",
-            "## Investment View",
-            f"- Signal: **{investment_view.get('signal', '')}**",
-            f"- Confidence: **{investment_view.get('confidence', '')}**",
-            f"- Expected short-term reaction: **{investment_view.get('expected_short_term_reaction', '')}**",
-            f"- Rationale: {investment_view.get('rationale', '')}",
-            "",
-            "## KPI Interpretation",
-        ]
-    )
-    lines.extend(
-        f"- **{item.get('kpi', '')}**: {item.get('interpretation', '')}"
-        for item in report.get("key_kpi_interpretation", [])
-    )
+    inv = report.get("investment_view", {})
+    if not isinstance(inv, dict):
+        inv = {}
+    kpi_items = report.get("key_kpi_interpretation", [])
+    if not isinstance(kpi_items, list):
+        kpi_items = []
+
+    lines = []
+    lines.append("# Аналитический отчет")
+    lines.append("")
+    lines.append("## Executive Summary")
+    lines.append(str(report.get("executive_summary", "")))
+    lines.append("")
+    lines.append("## Positive Factors")
+    for item in report.get("positive_factors", []):
+        lines.append(f"- {item}")
+    lines.append("")
+    lines.append("## Risk Factors")
+    for item in report.get("risk_factors", []):
+        lines.append(f"- {item}")
+    lines.append("")
+    lines.append("## Financial Health Assessment")
+    lines.append(str(report.get("financial_health_assessment", "")))
+    lines.append("")
+    lines.append("## Profitability Assessment")
+    lines.append(str(report.get("profitability_assessment", "")))
+    lines.append("")
+    lines.append("## Leverage Assessment")
+    lines.append(str(report.get("leverage_assessment", "")))
+    lines.append("")
+    lines.append("## Investment View")
+    lines.append(f"- Signal: **{inv.get('signal', '')}**")
+    lines.append(f"- Confidence: **{inv.get('confidence', '')}**")
+    lines.append(f"- Expected short-term reaction: **{inv.get('expected_short_term_reaction', '')}**")
+    lines.append(f"- Rationale: {inv.get('rationale', '')}")
+    lines.append("")
+    lines.append("## KPI Interpretation")
+    for item in kpi_items:
+        if isinstance(item, dict):
+            lines.append(f"- **{item.get('kpi', '')}**: {item.get('interpretation', '')}")
     return "\n".join(lines)
 
 
-def _to_struct(payload: dict[str, Any] | None) -> Struct:
-    struct = Struct()
-    if payload:
-        struct.update(payload)
-    return struct
+def _struct_to_dict(value: Any) -> dict[str, Any]:
+    if hasattr(value, "DESCRIPTOR"):
+        converted = MessageToDict(value, preserving_proto_field_name=True)
+        return converted if isinstance(converted, dict) else {}
+    if isinstance(value, dict):
+        return value
+    return {}
 
 
 class ClientApiService(analysis_pb2_grpc.ClientApiServiceServicer):
@@ -237,20 +108,6 @@ class ClientApiService(analysis_pb2_grpc.ClientApiServiceServicer):
                 logging.exception("ClickHouse connection is unavailable")
                 self.clickhouse = False
         return self.clickhouse
-
-    async def _run_ollama_json(self, prompt: str) -> tuple[dict[str, Any] | None, str]:
-        payload = {
-            "model": self.config.ollama_model,
-            "prompt": prompt,
-            "format": "json",
-            "stream": False,
-        }
-        async with httpx.AsyncClient(timeout=self.config.ollama_timeout_seconds) as client:
-            response = await client.post(f"{self.config.ollama_base_url}/api/generate", json=payload)
-            response.raise_for_status()
-            body = response.json()
-        raw_response = body.get("response", "{}")
-        return _extract_json(raw_response), raw_response
 
     async def AnalyzeDocument(
         self,
@@ -284,6 +141,7 @@ class ClientApiService(analysis_pb2_grpc.ClientApiServiceServicer):
                     document_id=document_id,
                     company_ticker=document.company_ticker,
                     extracted_text=parsing_response.extracted_text,
+                    candidates=parsing_response.candidates,
                 )
             )
 
@@ -373,45 +231,29 @@ class ClientApiService(analysis_pb2_grpc.ClientApiServiceServicer):
                     document_id=document_id,
                     company_ticker=request.ticker,
                     extracted_text=parsing_response.extracted_text,
+                    candidates=parsing_response.candidates,
+                )
+            )
+            outputs_response = await kpi_stub.GenerateAnalyticalOutputs(
+                analysis_pb2.GenerateAnalyticalOutputsRequest(
+                    company=request.company,
+                    ticker=request.ticker,
+                    event_date=request.event_date,
+                    filing_type=request.filing_type,
+                    fiscal_period=request.fiscal_period,
+                    currency=request.currency or "RUB",
+                    normalized_kpis_dict=dict(kpi_response.normalized_kpis_dict),
+                    derived_metrics=dict(kpi_response.derived_metrics),
                 )
             )
 
-        normalized_kpis = [
-            analysis_pb2.NormalizedKpi(
-                canonical_kpi=kpi.name,
-                value=_parse_float(kpi.value) or 0.0,
-                unit=kpi.unit,
-                period=kpi.period,
-                confidence=kpi.confidence,
-            )
-            for kpi in kpi_response.kpis
-            if _parse_float(kpi.value) is not None
-        ]
-        normalized_kpi_dict = _build_kpi_dict(normalized_kpis)
-        derived_metrics = _compute_derived_metrics(normalized_kpi_dict)
-
-        report_input = {
-            "company": request.company,
-            "ticker": request.ticker,
-            "event_date": request.event_date,
-            "filing_type": request.filing_type,
-            "fiscal_period": request.fiscal_period,
-            "currency": request.currency or "RUB",
-            "normalized_kpis": normalized_kpi_dict,
-            "derived_metrics": derived_metrics,
-        }
-
-        try:
-            analytical_report, analytical_raw = await self._run_ollama_json(
-                _build_analytical_report_prompt(report_input)
-            )
-            market_decision, decision_raw = await self._run_ollama_json(
-                _build_market_decision_prompt(report_input)
-            )
-        except httpx.HTTPError as exc:
-            await redis.hset(f"analysis:{document_id}", mapping={"status": "failed"})
-            logging.exception("Failed to generate analytical outputs")
-            await context.abort(grpc.StatusCode.UNAVAILABLE, f"Ollama request failed: {exc}")
+        normalized_kpis = list(kpi_response.normalized_kpis_list)
+        normalized_kpi_dict = dict(kpi_response.normalized_kpis_dict)
+        derived_metrics = dict(kpi_response.derived_metrics)
+        analytical_report = _struct_to_dict(outputs_response.analytical_report)
+        market_decision = _struct_to_dict(outputs_response.market_decision)
+        logging.info("RunPipeline outputs analytical_report keys=%s", sorted(analytical_report.keys()))
+        logging.info("RunPipeline outputs market_decision keys=%s", sorted(market_decision.keys()))
 
         rows = [
             [
@@ -465,24 +307,31 @@ class ClientApiService(analysis_pb2_grpc.ClientApiServiceServicer):
             fiscal_period=request.fiscal_period,
             currency=request.currency or "RUB",
             num_pages=int(parsing_response.metadata.get("num_pages", "0")),
-            num_candidates=len(kpi_response.kpis),
-            dictionary_hits=0,
-            llm_calls_for_normalization=0,
+            num_candidates=len(parsing_response.candidates),
+            dictionary_hits=int(kpi_response.dictionary_hits),
+            llm_calls_for_normalization=int(kpi_response.llm_calls_for_normalization),
         )
+
         logging.info("Completed pipeline for %s", document_id)
         return analysis_pb2.RunPipelineResponse(
             document_id=document_id,
             status="completed",
-            parsed_text=parsing_response.extracted_text,
+            analytical_report=outputs_response.analytical_report,
+            market_decision=outputs_response.market_decision,
+            analytical_report_markdown=_render_report_markdown(
+                analytical_report,
+                outputs_response.raw_analytical_response,
+            ),
             metadata=metadata,
+            debug_pages=parsing_response.debug_pages,
+            debug_candidates_raw=parsing_response.candidates,
+            debug_candidates_normalized_before_consolidation=kpi_response.normalized_items,
+            debug_failed_candidates=kpi_response.failed_candidates,
             normalized_kpis_list=normalized_kpis,
             normalized_kpis_dict=normalized_kpi_dict,
             derived_metrics=derived_metrics,
-            analytical_report=_to_struct(analytical_report),
-            market_decision=_to_struct(market_decision),
-            analytical_report_markdown=_render_report_markdown(analytical_report or {}),
-            raw_analytical_response=analytical_raw,
-            raw_decision_response=decision_raw,
+            raw_analytical_response=outputs_response.raw_analytical_response,
+            raw_decision_response=outputs_response.raw_decision_response,
         )
 
 

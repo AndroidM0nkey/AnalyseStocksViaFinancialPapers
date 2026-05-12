@@ -7,7 +7,7 @@ The project is designed as a Docker Compose based microservice system.
 - `client-api`: external gRPC entrypoint and orchestrator.
 - `parsing-service`: document parsing over gRPC.
 - `kpi-extraction-service`: KPI extraction over gRPC with Ollama REST calls.
-- `ollama`: local LLM runtime with `qwen2.5:1.5b`.
+- `ollama`: local LLM runtime with `qwen3:4b`.
 - `redis`: transient state and job metadata.
 - `clickhouse`: analytical storage for extracted KPIs.
 
@@ -22,7 +22,7 @@ All service-to-service communication is gRPC, except `kpi-extraction-service -> 
 docker compose up -d --build
 ```
 
-On the first start, the model `qwen2.5:1.5b` is downloaded into the persistent Docker volume `ollama_data`.
+On the first start, the model `qwen3:4b` is downloaded into the persistent Docker volume `ollama_data`.
 Next starts reuse the same volume, so the model is not downloaded again.
 
 ## External Interfaces

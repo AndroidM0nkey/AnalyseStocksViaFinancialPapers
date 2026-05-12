@@ -3,6 +3,8 @@ FROM python:3.12-slim
 ENV PYTHONDONTWRITEBYTECODE=1 \
     PYTHONUNBUFFERED=1 \
     PIP_NO_CACHE_DIR=1 \
+    PIP_DEFAULT_TIMEOUT=1200 \
+    PIP_PROGRESS_BAR=off \
     PYTHONPATH=/app/src:/app/generated
 
 WORKDIR /app
@@ -11,7 +13,7 @@ COPY pyproject.toml README.md /app/
 COPY proto /app/proto
 COPY src /app/src
 
-RUN pip install . && \
+RUN pip install --default-timeout=1200 . && \
     mkdir -p /app/generated && \
     python -m grpc_tools.protoc \
       -I/app/proto \

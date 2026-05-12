@@ -43,6 +43,12 @@ class KpiExtractionConfig(ServiceConfig):
     ollama_base_url: str
     ollama_model: str
     ollama_timeout_seconds: int
+    ollama_ready_timeout_seconds: int
+
+
+def _env_bool(name: str, default: bool) -> bool:
+    raw = os.getenv(name, "true" if default else "false").strip().lower()
+    return raw in {"1", "true", "yes", "on"}
 
 
 def load_service_config(service_name: str, default_port: int) -> ServiceConfig:
@@ -68,7 +74,7 @@ def load_client_api_config() -> ClientApiConfig:
         clickhouse_password=_env("CLICKHOUSE_PASSWORD", ""),
         clickhouse_database=_env("CLICKHOUSE_DATABASE", "analysis"),
         ollama_base_url=_env("OLLAMA_BASE_URL", "http://ollama:11434"),
-        ollama_model=_env("OLLAMA_MODEL", "qwen2.5:1.5b"),
+        ollama_model=_env("OLLAMA_MODEL", "qwen3:4b"),
         ollama_timeout_seconds=_env_int("OLLAMA_TIMEOUT_SECONDS", 120),
     )
 
@@ -80,6 +86,7 @@ def load_kpi_extraction_config() -> KpiExtractionConfig:
         grpc_host=base.grpc_host,
         grpc_port=base.grpc_port,
         ollama_base_url=_env("OLLAMA_BASE_URL", "http://ollama:11434"),
-        ollama_model=_env("OLLAMA_MODEL", "qwen2.5:1.5b"),
-        ollama_timeout_seconds=_env_int("OLLAMA_TIMEOUT_SECONDS", 120),
+        ollama_model=_env("OLLAMA_MODEL", "qwen3:4b"),
+        ollama_timeout_seconds=_env_int("OLLAMA_TIMEOUT_SECONDS", 180),
+        ollama_ready_timeout_seconds=_env_int("OLLAMA_READY_TIMEOUT_SECONDS", 180),
     )

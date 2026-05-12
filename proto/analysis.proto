@@ -20,6 +20,8 @@ message ParseDocumentResponse {
   string document_id = 1;
   string extracted_text = 2;
   map<string, string> metadata = 3;
+  repeated PageDebug debug_pages = 4;
+  repeated CandidateData candidates = 5;
 }
 
 message Kpi {
@@ -34,6 +36,7 @@ message ExtractKpisRequest {
   string document_id = 1;
   string company_ticker = 2;
   string extracted_text = 3;
+  repeated CandidateData candidates = 4;
 }
 
 message ExtractKpisResponse {
@@ -41,6 +44,31 @@ message ExtractKpisResponse {
   repeated Kpi kpis = 2;
   string model = 3;
   string raw_response = 4;
+  repeated NormalizedKpiDetail normalized_items = 5;
+  repeated NormalizedKpi normalized_kpis_list = 6;
+  map<string, double> normalized_kpis_dict = 7;
+  map<string, double> derived_metrics = 8;
+  int32 dictionary_hits = 9;
+  int32 llm_calls_for_normalization = 10;
+  repeated FailedCandidate failed_candidates = 11;
+}
+
+message GenerateAnalyticalOutputsRequest {
+  string company = 1;
+  string ticker = 2;
+  string event_date = 3;
+  string filing_type = 4;
+  string fiscal_period = 5;
+  string currency = 6;
+  map<string, double> normalized_kpis_dict = 7;
+  map<string, double> derived_metrics = 8;
+}
+
+message GenerateAnalyticalOutputsResponse {
+  google.protobuf.Struct analytical_report = 1;
+  google.protobuf.Struct market_decision = 2;
+  string raw_analytical_response = 3;
+  string raw_decision_response = 4;
 }
 
 message AnalyzeDocumentRequest {
@@ -82,6 +110,29 @@ message PipelineMetadata {
   int32 llm_calls_for_normalization = 11;
 }
 
+message PageDebug {
+  int32 page_num = 1;
+  string text = 2;
+  string section_hint = 3;
+  string section_type = 4;
+  double section_score = 5;
+}
+
+message CandidateData {
+  string source_type = 1;
+  int32 page_num = 2;
+  string section_hint = 3;
+  string section_type = 4;
+  double section_score = 5;
+  string label_text = 6;
+  string value_text = 7;
+  string raw_text = 8;
+  string normalized_value_text = 9;
+  string extracted_period = 10;
+  string pre_mapped_kpi = 11;
+  double pre_map_confidence = 12;
+}
+
 message NormalizedKpi {
   string canonical_kpi = 1;
   double value = 2;
@@ -90,19 +141,48 @@ message NormalizedKpi {
   double confidence = 5;
 }
 
+message NormalizedKpiDetail {
+  string canonical_kpi = 1;
+  double value = 2;
+  string unit = 3;
+  string period = 4;
+  bool is_kpi = 5;
+  double confidence = 6;
+  string reason = 7;
+  string source_type = 8;
+  int32 page_num = 9;
+  string section_hint = 10;
+  string section_type = 11;
+  double section_score = 12;
+  string label_text = 13;
+  string value_text = 14;
+  string normalized_value_text = 15;
+  string extracted_period = 16;
+  string raw_text = 17;
+  string normalization_source = 18;
+}
+
+message FailedCandidate {
+  CandidateData candidate = 1;
+  string error = 2;
+}
+
 message RunPipelineResponse {
   string document_id = 1;
   string status = 2;
-  string parsed_text = 3;
-  PipelineMetadata metadata = 4;
-  repeated NormalizedKpi normalized_kpis_list = 5;
-  map<string, double> normalized_kpis_dict = 6;
-  map<string, double> derived_metrics = 7;
-  google.protobuf.Struct analytical_report = 8;
-  google.protobuf.Struct market_decision = 9;
-  string analytical_report_markdown = 10;
-  string raw_analytical_response = 11;
-  string raw_decision_response = 12;
+  google.protobuf.Struct analytical_report = 3;
+  google.protobuf.Struct market_decision = 4;
+  string analytical_report_markdown = 5;
+  PipelineMetadata metadata = 6;
+  repeated PageDebug debug_pages = 7;
+  repeated CandidateData debug_candidates_raw = 8;
+  repeated NormalizedKpiDetail debug_candidates_normalized_before_consolidation = 9;
+  repeated FailedCandidate debug_failed_candidates = 10;
+  repeated NormalizedKpi normalized_kpis_list = 11;
+  map<string, double> normalized_kpis_dict = 12;
+  map<string, double> derived_metrics = 13;
+  string raw_analytical_response = 14;
+  string raw_decision_response = 15;
 }
 
 service ParsingService {
@@ -111,6 +191,7 @@ service ParsingService {
 
 service KpiExtractionService {
   rpc ExtractKpis(ExtractKpisRequest) returns (ExtractKpisResponse);
+  rpc GenerateAnalyticalOutputs(GenerateAnalyticalOutputsRequest) returns (GenerateAnalyticalOutputsResponse);
 }
 
 service ClientApiService {
