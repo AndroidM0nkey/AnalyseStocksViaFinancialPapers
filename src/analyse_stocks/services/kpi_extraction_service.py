@@ -9,7 +9,7 @@ import httpx
 import analysis_pb2
 import analysis_pb2_grpc
 from analyse_stocks.common.config import load_kpi_extraction_config
-from analyse_stocks.common.grpc_helpers import create_server, mark_serving, run_server
+from analyse_stocks.common.grpc_helpers import create_server, enable_reflection, mark_serving, run_server
 from analyse_stocks.common.logging import configure_logging
 
 
@@ -90,8 +90,10 @@ async def serve() -> None:
     config = load_kpi_extraction_config()
     configure_logging(config.service_name)
     server, health_servicer = create_server()
+    grpc_service_name = "analysestocks.v1.KpiExtractionService"
     analysis_pb2_grpc.add_KpiExtractionServiceServicer_to_server(KpiExtractionService(), server)
-    await mark_serving(health_servicer, ["analysestocks.v1.KpiExtractionService"])
+    enable_reflection(server, [grpc_service_name])
+    await mark_serving(health_servicer, [grpc_service_name])
     await run_server(server, config.bind_address, config.service_name)
 
 

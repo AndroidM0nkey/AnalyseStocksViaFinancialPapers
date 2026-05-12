@@ -52,17 +52,86 @@ services:
       - "${CLICKHOUSE_NATIVE_PORT:-9000}:9000"
     environment:
       CLICKHOUSE_DB: ${CLICKHOUSE_DATABASE:-analysis}
-      CLICKHOUSE_USER: ${CLICKHOUSE_USERNAME:-default}
-      CLICKHOUSE_PASSWORD: ${CLICKHOUSE_PASSWORD:-}
+      CLICKHOUSE_USER: ${CLICKHOUSE_USERNAME:-analysis_app}
+      CLICKHOUSE_PASSWORD: ${CLICKHOUSE_PASSWORD:-analysis_app_password}
+      CLICKHOUSE_DEFAULT_ACCESS_MANAGEMENT: 1
     volumes:
       - clickhouse_data:/var/lib/clickhouse
-      - ./docker/clickhouse/init:/docker-entrypoint-initdb.d:ro
     healthcheck:
       test: ["CMD-SHELL", "wget -qO- http://127.0.0.1:8123/ping | grep -q Ok."]
       interval: 10s
       timeout: 5s
       retries: 20
       start_period: 20s
+    restart: unless-stopped
+
+  clickhouse-init:
+    image: clickhouse/clickhouse-server:25.4-alpine
+    container_name: analyse-stocks-clickhouse-init
+    depends_on:
+      clickhouse:
+        condition: service_healthy
+    environment:
+      CLICKHOUSE_DATABASE: ${CLICKHOUSE_DATABASE:-analysis}
+      CLICKHOUSE_APP_USER: ${CLICKHOUSE_USERNAME:-analysis_app}
+      CLICKHOUSE_APP_PASSWORD: ${CLICKHOUSE_PASSWORD:-analysis_app_password}
+    entrypoint:
+      - /bin/sh
+      - /opt/init/init-clickhouse.sh
+    volumes:
+      - ./docker/clickhouse/init:/opt/init:ro
+    restart: "no"
+
+  loki:
+    image: grafana/loki:3.0.0
+    container_name: analyse-stocks-loki
+    command: -config.file=/etc/loki/config.yml
+    ports:
+      - "${LOKI_PORT:-3100}:3100"
+    volumes:
+      - ./docker/loki/config.yml:/etc/loki/config.yml:ro
+      - loki_data:/loki
+    restart: unless-stopped
+
+  promtail:
+    image: grafana/promtail:3.0.0
+    container_name: analyse-stocks-promtail
+    command: -config.file=/etc/promtail/config.yml
+    depends_on:
+      loki:
+        condition: service_started
+    volumes:
+      - ./docker/promtail/config.yml:/etc/promtail/config.yml:ro
+      - /var/run/docker.sock:/var/run/docker.sock
+    restart: unless-stopped
+
+  grafana:
+    image: grafana/grafana:11.0.0
+    container_name: analyse-stocks-grafana
+    depends_on:
+      loki:
+        condition: service_started
+    environment:
+      GF_SECURITY_ADMIN_USER: ${GRAFANA_ADMIN_USER:-admin}
+      GF_SECURITY_ADMIN_PASSWORD: ${GRAFANA_ADMIN_PASSWORD:-admin}
+    ports:
+      - "${GRAFANA_PORT:-3000}:3000"
+    volumes:
+      - grafana_data:/var/lib/grafana
+      - ./docker/grafana/provisioning:/etc/grafana/provisioning:ro
+    restart: unless-stopped
+
+  grpcui:
+    image: fullstorydev/grpcui:v1.4.3
+    container_name: analyse-stocks-grpcui
+    command:
+      - -plaintext
+      - client-api:50051
+    depends_on:
+      client-api:
+        condition: service_started
+    ports:
+      - "${GRPCUI_PORT:-8080}:8080"
     restart: unless-stopped
 
   parsing-service:
@@ -113,8 +182,8 @@ services:
       REDIS_URL: redis://redis:6379/0
       CLICKHOUSE_HOST: clickhouse
       CLICKHOUSE_PORT: 8123
-      CLICKHOUSE_USERNAME: ${CLICKHOUSE_USERNAME:-default}
-      CLICKHOUSE_PASSWORD: ${CLICKHOUSE_PASSWORD:-}
+      CLICKHOUSE_USERNAME: ${CLICKHOUSE_USERNAME:-analysis_app}
+      CLICKHOUSE_PASSWORD: ${CLICKHOUSE_PASSWORD:-analysis_app_password}
       CLICKHOUSE_DATABASE: ${CLICKHOUSE_DATABASE:-analysis}
     depends_on:
       redis:
@@ -133,3 +202,5 @@ volumes:
   ollama_data:
   redis_data:
   clickhouse_data:
+  loki_data:
+  grafana_data:

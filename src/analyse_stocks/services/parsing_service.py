@@ -7,7 +7,7 @@ import grpc
 import analysis_pb2
 import analysis_pb2_grpc
 from analyse_stocks.common.config import load_service_config
-from analyse_stocks.common.grpc_helpers import create_server, mark_serving, run_server
+from analyse_stocks.common.grpc_helpers import create_server, enable_reflection, mark_serving, run_server
 from analyse_stocks.common.logging import configure_logging
 
 
@@ -53,8 +53,10 @@ async def serve() -> None:
     config = load_service_config("parsing-service", 50052)
     configure_logging(config.service_name)
     server, health_servicer = create_server()
+    grpc_service_name = "analysestocks.v1.ParsingService"
     analysis_pb2_grpc.add_ParsingServiceServicer_to_server(ParsingService(), server)
-    await mark_serving(health_servicer, ["analysestocks.v1.ParsingService"])
+    enable_reflection(server, [grpc_service_name])
+    await mark_serving(health_servicer, [grpc_service_name])
     await run_server(server, config.bind_address, config.service_name)
 
 

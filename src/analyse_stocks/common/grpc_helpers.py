@@ -4,6 +4,7 @@ import logging
 
 import grpc
 from grpc_health.v1 import health, health_pb2, health_pb2_grpc
+from grpc_reflection.v1alpha import reflection
 
 
 def create_server() -> tuple[grpc.aio.Server, health.HealthServicer]:
@@ -25,3 +26,10 @@ async def run_server(server: grpc.aio.Server, bind_address: str, service_name: s
     await server.start()
     logging.info("%s is ready", service_name)
     await server.wait_for_termination()
+
+
+def enable_reflection(server: grpc.aio.Server, service_names: list[str]) -> None:
+    reflection.enable_server_reflection(
+        [*service_names, health.SERVICE_NAME, reflection.SERVICE_NAME],
+        server,
+    )
