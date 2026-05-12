@@ -33,6 +33,9 @@ class ClientApiConfig(ServiceConfig):
     clickhouse_username: str
     clickhouse_password: str
     clickhouse_database: str
+    ollama_base_url: str
+    ollama_model: str
+    ollama_timeout_seconds: int
 
 
 @dataclass(frozen=True)
@@ -64,6 +67,9 @@ def load_client_api_config() -> ClientApiConfig:
         clickhouse_username=_env("CLICKHOUSE_USERNAME", "default"),
         clickhouse_password=_env("CLICKHOUSE_PASSWORD", ""),
         clickhouse_database=_env("CLICKHOUSE_DATABASE", "analysis"),
+        ollama_base_url=_env("OLLAMA_BASE_URL", "http://ollama:11434"),
+        ollama_model=_env("OLLAMA_MODEL", "qwen2.5:1.5b"),
+        ollama_timeout_seconds=_env_int("OLLAMA_TIMEOUT_SECONDS", 120),
     )
 
 

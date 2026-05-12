@@ -2,6 +2,8 @@ syntax = "proto3";
 
 package analysestocks.v1;
 
+import "google/protobuf/struct.proto";
+
 message DocumentReference {
   string document_id = 1;
   string company_ticker = 2;
@@ -52,6 +54,57 @@ message AnalyzeDocumentResponse {
   string status = 4;
 }
 
+message RunPipelineRequest {
+  string document_id = 1;
+  string pdf_path = 2;
+  string company = 3;
+  string ticker = 4;
+  string event_date = 5;
+  string filing_type = 6;
+  string fiscal_period = 7;
+  string currency = 8;
+  string mime_type = 9;
+  string raw_text = 10;
+  string source_uri = 11;
+}
+
+message PipelineMetadata {
+  string pdf_path = 1;
+  string company = 2;
+  string ticker = 3;
+  string event_date = 4;
+  string filing_type = 5;
+  string fiscal_period = 6;
+  string currency = 7;
+  int32 num_pages = 8;
+  int32 num_candidates = 9;
+  int32 dictionary_hits = 10;
+  int32 llm_calls_for_normalization = 11;
+}
+
+message NormalizedKpi {
+  string canonical_kpi = 1;
+  double value = 2;
+  string unit = 3;
+  string period = 4;
+  double confidence = 5;
+}
+
+message RunPipelineResponse {
+  string document_id = 1;
+  string status = 2;
+  string parsed_text = 3;
+  PipelineMetadata metadata = 4;
+  repeated NormalizedKpi normalized_kpis_list = 5;
+  map<string, double> normalized_kpis_dict = 6;
+  map<string, double> derived_metrics = 7;
+  google.protobuf.Struct analytical_report = 8;
+  google.protobuf.Struct market_decision = 9;
+  string analytical_report_markdown = 10;
+  string raw_analytical_response = 11;
+  string raw_decision_response = 12;
+}
+
 service ParsingService {
   rpc ParseDocument(ParseDocumentRequest) returns (ParseDocumentResponse);
 }
@@ -62,4 +115,5 @@ service KpiExtractionService {
 
 service ClientApiService {
   rpc AnalyzeDocument(AnalyzeDocumentRequest) returns (AnalyzeDocumentResponse);
+  rpc RunPipeline(RunPipelineRequest) returns (RunPipelineResponse);
 }

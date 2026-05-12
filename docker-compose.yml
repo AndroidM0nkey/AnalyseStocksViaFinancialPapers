@@ -126,7 +126,7 @@ services:
     container_name: analyse-stocks-grpcui
     command:
       - -plaintext
-      - client-api:50051
+      - host.docker.internal:50051
     depends_on:
       client-api:
         condition: service_started
