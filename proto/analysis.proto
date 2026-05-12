@@ -1,0 +1,65 @@
+syntax = "proto3";
+
+package analysestocks.v1;
+
+message DocumentReference {
+  string document_id = 1;
+  string company_ticker = 2;
+  string source_uri = 3;
+  string mime_type = 4;
+  string raw_text = 5;
+}
+
+message ParseDocumentRequest {
+  DocumentReference document = 1;
+}
+
+message ParseDocumentResponse {
+  string document_id = 1;
+  string extracted_text = 2;
+  map<string, string> metadata = 3;
+}
+
+message Kpi {
+  string name = 1;
+  string value = 2;
+  string unit = 3;
+  string period = 4;
+  double confidence = 5;
+}
+
+message ExtractKpisRequest {
+  string document_id = 1;
+  string company_ticker = 2;
+  string extracted_text = 3;
+}
+
+message ExtractKpisResponse {
+  string document_id = 1;
+  repeated Kpi kpis = 2;
+  string model = 3;
+  string raw_response = 4;
+}
+
+message AnalyzeDocumentRequest {
+  DocumentReference document = 1;
+}
+
+message AnalyzeDocumentResponse {
+  string document_id = 1;
+  string parsed_text = 2;
+  repeated Kpi kpis = 3;
+  string status = 4;
+}
+
+service ParsingService {
+  rpc ParseDocument(ParseDocumentRequest) returns (ParseDocumentResponse);
+}
+
+service KpiExtractionService {
+  rpc ExtractKpis(ExtractKpisRequest) returns (ExtractKpisResponse);
+}
+
+service ClientApiService {
+  rpc AnalyzeDocument(AnalyzeDocumentRequest) returns (AnalyzeDocumentResponse);
+}
