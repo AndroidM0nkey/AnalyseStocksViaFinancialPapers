@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 import logging
 import uuid
 from typing import Any
@@ -7,7 +8,7 @@ from typing import Any
 import clickhouse_connect
 import grpc
 from clickhouse_connect.driver.exceptions import ClickHouseError
-from google.protobuf.json_format import MessageToDict
+from google.protobuf.json_format import MessageToDict, ParseDict
 from redis.asyncio import from_url as redis_from_url
 
 import analysis_pb2
@@ -81,6 +82,10 @@ def _struct_to_dict(value: Any) -> dict[str, Any]:
     if isinstance(value, dict):
         return value
     return {}
+
+
+def _result_storage_key(document_id: str) -> str:
+    return f"analysis-result:{document_id}"
 
 
 class ClientApiService(analysis_pb2_grpc.ClientApiServiceServicer):
@@ -312,8 +317,7 @@ class ClientApiService(analysis_pb2_grpc.ClientApiServiceServicer):
             llm_calls_for_normalization=int(kpi_response.llm_calls_for_normalization),
         )
 
-        logging.info("Completed pipeline for %s", document_id)
-        return analysis_pb2.RunPipelineResponse(
+        response = analysis_pb2.RunPipelineResponse(
             document_id=document_id,
             status="completed",
             analytical_report=outputs_response.analytical_report,
@@ -333,6 +337,48 @@ class ClientApiService(analysis_pb2_grpc.ClientApiServiceServicer):
             raw_analytical_response=outputs_response.raw_analytical_response,
             raw_decision_response=outputs_response.raw_decision_response,
         )
+        await redis.set(
+            _result_storage_key(document_id),
+            json.dumps(MessageToDict(response, preserving_proto_field_name=True), ensure_ascii=False),
+        )
+
+        logging.info("Completed pipeline for %s", document_id)
+        return response
+
+    async def GetPipelineResult(
+        self,
+        request: analysis_pb2.GetPipelineResultRequest,
+        context: grpc.aio.ServicerContext,
+    ) -> analysis_pb2.RunPipelineResponse:
+        document_id = request.document_id.strip()
+        if not document_id:
+            await context.abort(grpc.StatusCode.INVALID_ARGUMENT, "document_id is required.")
+
+        redis = self._get_redis()
+        stored_payload = await redis.get(_result_storage_key(document_id))
+        if not stored_payload:
+            legacy_status = await redis.hget(f"analysis:{document_id}", "status")
+            if legacy_status:
+                return analysis_pb2.RunPipelineResponse(
+                    document_id=document_id,
+                    status=legacy_status,
+                )
+            await context.abort(
+                grpc.StatusCode.NOT_FOUND,
+                f"Stored pipeline result for {document_id} was not found.",
+            )
+
+        try:
+            payload = json.loads(stored_payload)
+            response = analysis_pb2.RunPipelineResponse()
+            ParseDict(payload, response)
+            return response
+        except (json.JSONDecodeError, ValueError, TypeError):
+            logging.exception("Failed to decode stored pipeline result for %s", document_id)
+            await context.abort(
+                grpc.StatusCode.INTERNAL,
+                f"Stored pipeline result for {document_id} is corrupted.",
+            )
 
 
 async def serve() -> None:

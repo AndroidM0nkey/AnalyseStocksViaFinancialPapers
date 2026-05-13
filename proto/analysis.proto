@@ -185,6 +185,10 @@ message RunPipelineResponse {
   string raw_decision_response = 15;
 }
 
+message GetPipelineResultRequest {
+  string document_id = 1;
+}
+
 service ParsingService {
   rpc ParseDocument(ParseDocumentRequest) returns (ParseDocumentResponse);
 }
@@ -197,4 +201,5 @@ service KpiExtractionService {
 service ClientApiService {
   rpc AnalyzeDocument(AnalyzeDocumentRequest) returns (AnalyzeDocumentResponse);
   rpc RunPipeline(RunPipelineRequest) returns (RunPipelineResponse);
+  rpc GetPipelineResult(GetPipelineResultRequest) returns (RunPipelineResponse);
 }
