@@ -2,8 +2,12 @@ services:
   ollama:
     image: ollama/ollama:latest
     container_name: analyse-stocks-ollama
+    gpus: all
     ports:
       - "${OLLAMA_PORT:-11434}:11434"
+    environment:
+      NVIDIA_VISIBLE_DEVICES: all
+      NVIDIA_DRIVER_CAPABILITIES: compute,utility
     volumes:
       - ollama_data:/root/.ollama
     healthcheck:
@@ -24,11 +28,184 @@ services:
       - /opt/init/pull-model.sh
     environment:
       OLLAMA_HOST: http://ollama:11434
-      OLLAMA_MODEL: ${OLLAMA_MODEL:-qwen2.5:1.5b}
+      OLLAMA_MODEL: ${OLLAMA_MODEL:-qwen3:4b}
     volumes:
       - ./docker/ollama:/opt/init:ro
       - ollama_data:/root/.ollama
     restart: "no"
 
+  redis:
+    image: redis:7-alpine
+    container_name: analyse-stocks-redis
+    ports:
+      - "${REDIS_PORT:-6379}:6379"
+    volumes:
+      - redis_data:/data
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 10s
+      timeout: 5s
+      retries: 12
+    restart: unless-stopped
+
+  clickhouse:
+    image: clickhouse/clickhouse-server:25.4-alpine
+    container_name: analyse-stocks-clickhouse
+    ports:
+      - "${CLICKHOUSE_HTTP_PORT:-8123}:8123"
+      - "${CLICKHOUSE_NATIVE_PORT:-9000}:9000"
+    environment:
+      CLICKHOUSE_DB: ${CLICKHOUSE_DATABASE:-analysis}
+      CLICKHOUSE_USER: ${CLICKHOUSE_USERNAME:-analysis_app}
+      CLICKHOUSE_PASSWORD: ${CLICKHOUSE_PASSWORD:-analysis_app_password}
+      CLICKHOUSE_DEFAULT_ACCESS_MANAGEMENT: 1
+    volumes:
+      - clickhouse_data:/var/lib/clickhouse
+    healthcheck:
+      test: ["CMD-SHELL", "wget -qO- http://127.0.0.1:8123/ping | grep -q Ok."]
+      interval: 10s
+      timeout: 5s
+      retries: 20
+      start_period: 20s
+    restart: unless-stopped
+
+  clickhouse-init:
+    image: clickhouse/clickhouse-server:25.4-alpine
+    container_name: analyse-stocks-clickhouse-init
+    depends_on:
+      clickhouse:
+        condition: service_healthy
+    environment:
+      CLICKHOUSE_DATABASE: ${CLICKHOUSE_DATABASE:-analysis}
+      CLICKHOUSE_APP_USER: ${CLICKHOUSE_USERNAME:-analysis_app}
+      CLICKHOUSE_APP_PASSWORD: ${CLICKHOUSE_PASSWORD:-analysis_app_password}
+    entrypoint:
+      - /bin/sh
+      - /opt/init/init-clickhouse.sh
+    volumes:
+      - ./docker/clickhouse/init:/opt/init:ro
+    restart: "no"
+
+  loki:
+    image: grafana/loki:3.0.0
+    container_name: analyse-stocks-loki
+    command: -config.file=/etc/loki/config.yml
+    ports:
+      - "${LOKI_PORT:-3100}:3100"
+    volumes:
+      - ./docker/loki/config.yml:/etc/loki/config.yml:ro
+      - loki_data:/loki
+    restart: unless-stopped
+
+  promtail:
+    image: grafana/promtail:3.0.0
+    container_name: analyse-stocks-promtail
+    command: -config.file=/etc/promtail/config.yml
+    depends_on:
+      loki:
+        condition: service_started
+    volumes:
+      - ./docker/promtail/config.yml:/etc/promtail/config.yml:ro
+      - /var/run/docker.sock:/var/run/docker.sock
+    restart: unless-stopped
+
+  grafana:
+    image: grafana/grafana:11.0.0
+    container_name: analyse-stocks-grafana
+    depends_on:
+      loki:
+        condition: service_started
+    environment:
+      GF_SECURITY_ADMIN_USER: ${GRAFANA_ADMIN_USER:-admin}
+      GF_SECURITY_ADMIN_PASSWORD: ${GRAFANA_ADMIN_PASSWORD:-admin}
+    ports:
+      - "${GRAFANA_PORT:-3000}:3000"
+    volumes:
+      - grafana_data:/var/lib/grafana
+      - ./docker/grafana/provisioning:/etc/grafana/provisioning:ro
+    restart: unless-stopped
+
+  grpcui:
+    image: fullstorydev/grpcui:v1.4.3
+    container_name: analyse-stocks-grpcui
+    command:
+      - -plaintext
+      - host.docker.internal:50051
+    depends_on:
+      client-api:
+        condition: service_started
+    ports:
+      - "${GRPCUI_PORT:-8080}:8080"
+    restart: unless-stopped
+
+  parsing-service:
+    build:
+      context: .
+      dockerfile: docker/python-service/Dockerfile
+      args:
+        SERVICE_MODULE: analyse_stocks.services.parsing_service
+    container_name: analyse-stocks-parsing-service
+    environment:
+      GRPC_PORT: 50052
+    volumes:
+      - ./:/workspace:ro
+    ports:
+      - "${PARSING_SERVICE_PORT:-50052}:50052"
+    restart: unless-stopped
+
+  kpi-extraction-service:
+    build:
+      context: .
+      dockerfile: docker/python-service/Dockerfile
+      args:
+        SERVICE_MODULE: analyse_stocks.services.kpi_extraction_service
+    container_name: analyse-stocks-kpi-extraction-service
+    environment:
+      GRPC_PORT: 50053
+      OLLAMA_BASE_URL: http://ollama:11434
+      OLLAMA_MODEL: ${OLLAMA_MODEL:-qwen3:4b}
+      OLLAMA_TIMEOUT_SECONDS: ${OLLAMA_TIMEOUT_SECONDS:-180}
+      OLLAMA_READY_TIMEOUT_SECONDS: ${OLLAMA_READY_TIMEOUT_SECONDS:-180}
+    depends_on:
+      ollama:
+        condition: service_healthy
+    ports:
+      - "${KPI_EXTRACTION_SERVICE_PORT:-50053}:50053"
+    restart: unless-stopped
+
+  client-api:
+    build:
+      context: .
+      dockerfile: docker/python-service/Dockerfile
+      args:
+        SERVICE_MODULE: analyse_stocks.services.client_api
+    container_name: analyse-stocks-client-api
+    environment:
+      GRPC_PORT: 50051
+      PARSING_SERVICE_ADDRESS: parsing-service:50052
+      KPI_EXTRACTION_SERVICE_ADDRESS: kpi-extraction-service:50053
+      REDIS_URL: redis://redis:6379/0
+      CLICKHOUSE_HOST: clickhouse
+      CLICKHOUSE_PORT: 8123
+      CLICKHOUSE_USERNAME: ${CLICKHOUSE_USERNAME:-analysis_app}
+      CLICKHOUSE_PASSWORD: ${CLICKHOUSE_PASSWORD:-analysis_app_password}
+      CLICKHOUSE_DATABASE: ${CLICKHOUSE_DATABASE:-analysis}
+    depends_on:
+      redis:
+        condition: service_healthy
+      clickhouse:
+        condition: service_healthy
+      parsing-service:
+        condition: service_started
+      kpi-extraction-service:
+        condition: service_started
+    ports:
+      - "${CLIENT_API_PORT:-50051}:50051"
+    restart: unless-stopped
+
 volumes:
   ollama_data:
+  redis_data:
+  clickhouse_data:
+  loki_data:
+  grafana_data:
