@@ -131,6 +131,11 @@ MULTIPLIERS = {
     "trillion": 1_000_000_000_000,
 }
 
+MONETARY_LABEL_PATTERN = re.compile(
+    r"(выруч|ebitda|прибыл|актив|капитал|денежн|долг|обязат|cash|revenue|income|assets|equity|debt)",
+    re.IGNORECASE,
+)
+
 MONETARY_UNITS = {"RUB", "USD", "EUR"}
 MONETARY_KPIS = {
     "revenue",
@@ -256,6 +261,34 @@ def detect_unit(text: str) -> str | None:
     if "eur" in lower_text or "\u20ac" in lower_text:
         return "EUR"
     return None
+
+
+def detect_page_scale_hint(text: str) -> tuple[int | None, str | None]:
+    if not text:
+        return None, None
+    header = " ".join(text.lower().splitlines()[:12])
+    if (
+        "в млрд руб" in header
+        or "млрд руб" in header
+        or "в миллиардах российских рублей" in header
+        or "в миллиардах рублей" in header
+    ):
+        return 1_000_000_000, "RUB"
+    if (
+        "в млн руб" in header
+        or "млн руб" in header
+        or "в миллионах российских рублей" in header
+        or "в миллионах рублей" in header
+    ):
+        return 1_000_000, "RUB"
+    if (
+        "в тыс. руб" in header
+        or "тыс. руб" in header
+        or "в тысячах российских рублей" in header
+        or "в тысячах рублей" in header
+    ):
+        return 1_000, "RUB"
+    return None, None
 
 
 def normalize_scale_in_value_text(value_text: str) -> tuple[float | None, str | None, str | None]:
@@ -407,6 +440,7 @@ def make_candidate(page: dict[str, Any], source_type: str, label: str, value: st
 
 def generate_table_candidates(page: dict[str, Any]) -> list[Candidate]:
     out: list[Candidate] = []
+    page_multiplier, page_unit = detect_page_scale_hint(page.get("text", ""))
     for table in page.get("tables", []):
         if not table:
             continue
@@ -423,8 +457,19 @@ def generate_table_candidates(page: dict[str, Any]) -> list[Candidate]:
             raw = " | ".join(cells)
             if looks_like_bad_candidate(label, value_candidate, raw):
                 continue
+            effective_value = value_candidate
+            if (
+                page_multiplier
+                and page_unit == "RUB"
+                and detect_unit(value_candidate) is None
+                and not any(scale in value_candidate.lower() for scale in MULTIPLIERS)
+                and MONETARY_LABEL_PATTERN.search(label)
+            ):
+                effective_value = f"{value_candidate} млрд руб." if page_multiplier == 1_000_000_000 else (
+                    f"{value_candidate} млн руб." if page_multiplier == 1_000_000 else f"{value_candidate} тыс. руб."
+                )
             if re.search(r"(\u0432\u044b\u0440\u0443\u0447|ebitda|\u043f\u0440\u0438\u0431\u044b\u043b|\u0430\u043a\u0442\u0438\u0432|\u043a\u0430\u043f\u0438\u0442\u0430\u043b|\u0434\u0435\u043d\u0435\u0436\u043d|\u0434\u043e\u043b\u0433|\u043e\u0431\u044f\u0437\u0430\u0442|eps)", label, re.IGNORECASE):
-                out.append(make_candidate(page, "table_row", label, value_candidate, raw))
+                out.append(make_candidate(page, "table_row", label, effective_value, raw))
     return out
 
 

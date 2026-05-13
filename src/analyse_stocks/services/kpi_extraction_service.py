@@ -88,6 +88,8 @@ Candidate fields:
 
 
 def _build_analytical_report_prompt(report_input: dict[str, Any]) -> str:
+    kpi_summary = _build_kpi_summary(report_input)
+    constraints = _build_analysis_constraints(report_input)
     return f"""
 You are a senior equity research analyst.
 
@@ -104,15 +106,18 @@ Filing type: {report_input.get("filing_type")}
 Fiscal period: {report_input.get("fiscal_period")}
 Currency: {report_input.get("currency")}
 
-Normalized KPIs:
-{json.dumps(report_input.get("normalized_kpis", {}), ensure_ascii=False, indent=2)}
+KPI summary:
+{kpi_summary}
 
-Derived metrics:
-{json.dumps(report_input.get("derived_metrics", {}), ensure_ascii=False, indent=2)}
+Constraints:
+{constraints}
 
 Keep the response concise.
 Do not repeat KPI values more than once.
 Do not include markdown.
+Do not output KPI dictionary keys as top-level JSON keys.
+Do not infer leverage conclusions unless debt is explicitly present in the KPI summary.
+Do not call high cash balance a risk by itself.
 Return one valid JSON object only with exactly these keys:
 {{
   "executive_summary": "",
@@ -140,6 +145,8 @@ Limit "key_kpi_interpretation" to at most 5 items.
 
 
 def _build_market_decision_prompt(report_input: dict[str, Any]) -> str:
+    kpi_summary = _build_kpi_summary(report_input)
+    constraints = _build_analysis_constraints(report_input)
     return f"""
 You are a senior equity research analyst.
 
@@ -156,13 +163,17 @@ Filing type: {report_input.get("filing_type")}
 Fiscal period: {report_input.get("fiscal_period")}
 Currency: {report_input.get("currency")}
 
-Normalized KPIs:
-{json.dumps(report_input.get("normalized_kpis", {}), ensure_ascii=False, indent=2)}
+KPI summary:
+{kpi_summary}
 
-Derived metrics:
-{json.dumps(report_input.get("derived_metrics", {}), ensure_ascii=False, indent=2)}
+Constraints:
+{constraints}
 
 Keep the response concise.
+Signal must be one of: buy, hold, sell.
+Confidence must be between 0.0 and 1.0.
+expected_move and rationale must be non-empty.
+If the data is incomplete or mixed, prefer hold with medium confidence rather than empty fields.
 Return one valid JSON object only with exactly these keys:
 {{
   "signal": "hold",
@@ -274,14 +285,199 @@ def _is_valid_analytical_report(payload: dict[str, Any] | None) -> bool:
     if not required.issubset(payload.keys()):
         return False
     investment_view = payload.get("investment_view")
-    return isinstance(investment_view, dict) and "signal" in investment_view and "rationale" in investment_view
+    if not isinstance(investment_view, dict):
+        return False
+    if "signal" not in investment_view or "rationale" not in investment_view:
+        return False
+    return isinstance(payload.get("positive_factors"), list) and isinstance(payload.get("risk_factors"), list)
 
 
 def _is_valid_market_decision(payload: dict[str, Any] | None) -> bool:
     if not isinstance(payload, dict):
         return False
     required = {"signal", "confidence", "expected_move", "rationale"}
-    return required.issubset(payload.keys())
+    if not required.issubset(payload.keys()):
+        return False
+    signal = str(payload.get("signal", "")).strip().lower()
+    if signal not in {"buy", "hold", "sell"}:
+        return False
+    try:
+        confidence = float(payload.get("confidence", 0.0))
+    except (TypeError, ValueError):
+        return False
+    expected_move = str(payload.get("expected_move", "")).strip()
+    rationale = str(payload.get("rationale", "")).strip()
+    return 0.0 <= confidence <= 1.0 and bool(expected_move) and bool(rationale)
+
+
+def _clean_text_value(value: Any) -> str:
+    text = str(value or "").strip()
+    text = re.sub(r"\s+", " ", text)
+    text = re.sub(r"\bмлр:\b", "млрд", text)
+    return text
+
+
+def _trim_list(items: Any, limit: int) -> list[str]:
+    if not isinstance(items, list):
+        return []
+    cleaned = [_clean_text_value(item) for item in items if _clean_text_value(item)]
+    return cleaned[:limit]
+
+
+def _localize_text_value(value: Any) -> str:
+    text = _clean_text_value(value)
+    text = text.replace("R.РУБ", "млрд руб.")
+    text = text.replace("RUB", "руб.")
+    text = text.replace("млрд млрд руб.", "млрд руб.")
+    text = text.replace("млрд млрд руб", "млрд руб")
+    text = text.replace(" млрд руб..", " млрд руб.")
+    text = text.replace(" млн руб..", " млн руб.")
+    text = text.replace(" тыс. руб..", " тыс. руб.")
+    return text
+
+
+def _localize_kpi_name(name: str) -> str:
+    mapping = {
+        "revenue": "Выручка",
+        "operating margin": "Операционная маржа",
+        "operating_margin": "Операционная маржа",
+        "net margin": "Чистая маржа",
+        "net_margin": "Чистая маржа",
+        "cash": "Кассовый резерв",
+        "total assets": "Общие активы",
+        "total_assets": "Общие активы",
+        "operating income": "Операционная прибыль",
+        "operating_income": "Операционная прибыль",
+        "net income": "Чистая прибыль",
+        "net_income": "Чистая прибыль",
+    }
+    return mapping.get(name.strip().lower(), name)
+
+
+def _clean_interpretations(items: Any) -> list[dict[str, str]]:
+    if not isinstance(items, list):
+        return []
+    cleaned: list[dict[str, str]] = []
+    for item in items:
+        if not isinstance(item, dict):
+            continue
+        kpi = _localize_kpi_name(_clean_text_value(item.get("kpi")))
+        interpretation = _localize_text_value(item.get("interpretation"))
+        if kpi and interpretation:
+            cleaned.append({"kpi": kpi, "interpretation": interpretation})
+    return cleaned[:5]
+
+
+def _sanitize_analytical_report(payload: dict[str, Any], report_input: dict[str, Any]) -> dict[str, Any]:
+    normalized = report_input.get("normalized_kpis", {})
+    has_debt = isinstance(normalized.get("debt"), (int, float))
+    has_cash = isinstance(normalized.get("cash"), (int, float))
+    currency = report_input.get("currency") or "RUB"
+
+    report = dict(payload)
+    report["executive_summary"] = _localize_text_value(report.get("executive_summary"))
+    report["financial_health_assessment"] = _localize_text_value(report.get("financial_health_assessment"))
+    report["profitability_assessment"] = _localize_text_value(report.get("profitability_assessment"))
+    report["leverage_assessment"] = _localize_text_value(report.get("leverage_assessment"))
+    report["positive_factors"] = [_localize_text_value(item) for item in _trim_list(report.get("positive_factors"), 3)]
+    report["risk_factors"] = [_localize_text_value(item) for item in _trim_list(report.get("risk_factors"), 3)]
+    report["key_kpi_interpretation"] = _clean_interpretations(report.get("key_kpi_interpretation"))
+
+    investment_view = report.get("investment_view")
+    if not isinstance(investment_view, dict):
+        investment_view = {}
+    report["investment_view"] = {
+        "signal": str(investment_view.get("signal", "hold")).strip().lower() or "hold",
+        "confidence": float(investment_view.get("confidence", 0.0) or 0.0),
+        "expected_short_term_reaction": _localize_text_value(investment_view.get("expected_short_term_reaction")),
+        "rationale": _localize_text_value(investment_view.get("rationale")),
+    }
+
+    fallback_mode = "fallback" in report["executive_summary"].lower() or "fallback" in report["investment_view"]["rationale"].lower()
+    if fallback_mode:
+        positive_factors: list[str] = []
+        interpretations: list[dict[str, str]] = []
+        revenue = normalized.get("revenue")
+        net_income = normalized.get("net_income")
+        cash = normalized.get("cash")
+        operating_margin = report_input.get("derived_metrics", {}).get("operating_margin")
+        if isinstance(revenue, (int, float)):
+            text = f"Выручка составила {_format_currency_human(revenue, currency)}."
+            positive_factors.append(text)
+            interpretations.append({"kpi": "revenue", "interpretation": text})
+        if isinstance(net_income, (int, float)):
+            text = f"Чистая прибыль составила {_format_currency_human(net_income, currency)}."
+            positive_factors.append(text)
+            interpretations.append({"kpi": "net_income", "interpretation": text})
+        if isinstance(cash, (int, float)):
+            positive_factors.append(f"Денежные средства составили {_format_currency_human(cash, currency)}.")
+            interpretations.append(
+                {
+                    "kpi": "cash",
+                    "interpretation": f"Объем денежных средств составил {_format_currency_human(cash, currency)}.",
+                }
+            )
+        if isinstance(operating_margin, (int, float)):
+            interpretations.append(
+                {
+                    "kpi": "operating_margin",
+                    "interpretation": f"Операционная маржа составила {operating_margin:.2%}.",
+                }
+            )
+        if positive_factors:
+            report["positive_factors"] = positive_factors[:3]
+        if interpretations:
+            report["key_kpi_interpretation"] = interpretations[:5]
+        report["executive_summary"] = (
+            f"{report_input.get('company') or 'Компания'} показала набор KPI, достаточный для базовой оценки результатов. "
+            "Отчет построен fallback-логикой, потому что модель не вернула валидный структурированный JSON."
+        )
+        report["financial_health_assessment"] = "Умеренно позитивная, если ориентироваться на доступные KPI и запас ликвидности."
+        report["profitability_assessment"] = "Умеренно позитивная на основе доступных показателей прибыли и маржинальности."
+
+    if not has_debt:
+        leverage_fallback = "Оценка долговой нагрузки ограничена, потому что валидный показатель долга не был извлечен."
+        report["leverage_assessment"] = leverage_fallback
+        report["risk_factors"] = [
+            item
+            for item in report["risk_factors"]
+            if "заем" not in item.lower() and "долг" not in item.lower() and "левер" not in item.lower()
+        ]
+        if not report["risk_factors"]:
+            report["risk_factors"] = ["Структура долга и обязательств раскрыта неполно, поэтому оценка рисков ограничена."]
+
+    if not has_cash:
+        report["risk_factors"] = [
+            item
+            for item in report["risk_factors"]
+            if "ликвид" not in item.lower()
+        ] or report["risk_factors"]
+
+    return report
+
+
+def _sanitize_market_decision(payload: dict[str, Any], report_input: dict[str, Any]) -> dict[str, Any]:
+    decision = dict(payload)
+    signal = str(decision.get("signal", "hold")).strip().lower()
+    if signal not in {"buy", "hold", "sell"}:
+        signal = "hold"
+    try:
+        confidence = float(decision.get("confidence", 0.0) or 0.0)
+    except (TypeError, ValueError):
+        confidence = 0.0
+    confidence = min(max(confidence, 0.0), 1.0)
+    expected_move = _localize_text_value(decision.get("expected_move"))
+    rationale = _localize_text_value(decision.get("rationale"))
+
+    if not expected_move or not rationale or confidence <= 0.0:
+        return _build_fallback_market_decision(report_input)
+
+    return {
+        "signal": signal,
+        "confidence": confidence,
+        "expected_move": expected_move,
+        "rationale": rationale,
+    }
 
 
 def _repair_invalid_json(
@@ -711,6 +907,7 @@ class KpiExtractionService(analysis_pb2_grpc.KpiExtractionServiceServicer):
             report_input,
             "Analytical report",
         )
+        analytical_report = _sanitize_analytical_report(analytical_report, report_input)
         market_decision, decision_raw = _run_validated_json_with_repair(
             self.config,
             [
@@ -724,6 +921,7 @@ class KpiExtractionService(analysis_pb2_grpc.KpiExtractionServiceServicer):
             report_input,
             "Market decision",
         )
+        market_decision = _sanitize_market_decision(market_decision, report_input)
 
         return analysis_pb2.GenerateAnalyticalOutputsResponse(
             analytical_report=_to_struct(analytical_report),
@@ -731,6 +929,92 @@ class KpiExtractionService(analysis_pb2_grpc.KpiExtractionServiceServicer):
             raw_analytical_response=analytical_raw,
             raw_decision_response=decision_raw,
         )
+
+def _format_decimal_human(value: float) -> str:
+    text = f"{value:.1f}" if abs(value) >= 100 else f"{value:.2f}"
+    return text.rstrip("0").rstrip(".")
+
+
+def _format_currency_human(value: Any, currency: str | None = None) -> str:
+    if not isinstance(value, (int, float)):
+        return "н/д"
+    currency = currency or "RUB"
+    abs_value = abs(float(value))
+    sign = "-" if float(value) < 0 else ""
+    if abs_value >= 1_000_000_000:
+        return f"{sign}{_format_decimal_human(abs_value / 1_000_000_000)} млрд {currency}"
+    if abs_value >= 1_000_000:
+        return f"{sign}{_format_decimal_human(abs_value / 1_000_000)} млн {currency}"
+    if abs_value >= 1_000:
+        return f"{sign}{_format_decimal_human(abs_value / 1_000)} тыс. {currency}"
+    return f"{sign}{_format_decimal_human(abs_value)} {currency}"
+
+
+def _format_metric_human(name: str, value: Any, currency: str | None = None) -> str:
+    if not isinstance(value, (int, float)):
+        return "н/д"
+    if name.endswith("_margin"):
+        return f"{value:.2%}"
+    return _format_currency_human(value, currency)
+
+
+def _build_kpi_summary(report_input: dict[str, Any]) -> str:
+    normalized = report_input.get("normalized_kpis", {})
+    derived = report_input.get("derived_metrics", {})
+    currency = report_input.get("currency") or "RUB"
+    ordered = [
+        "revenue",
+        "operating_income",
+        "ebitda",
+        "net_income",
+        "cash",
+        "debt",
+        "equity",
+        "total_assets",
+        "operating_cash_flow",
+        "capex",
+    ]
+    labels = {
+        "revenue": "Revenue",
+        "operating_income": "Operating income",
+        "ebitda": "EBITDA",
+        "net_income": "Net income",
+        "cash": "Cash",
+        "debt": "Debt",
+        "equity": "Equity",
+        "total_assets": "Total assets",
+        "operating_cash_flow": "Operating cash flow",
+        "capex": "Capex",
+        "operating_margin": "Operating margin",
+        "net_margin": "Net margin",
+        "ebitda_margin": "EBITDA margin",
+    }
+    lines: list[str] = []
+    for key in ordered:
+        value = normalized.get(key)
+        if isinstance(value, (int, float)):
+            lines.append(f"- {labels.get(key, key)}: {_format_metric_human(key, value, currency)}")
+    for key in ("operating_margin", "net_margin", "ebitda_margin"):
+        value = derived.get(key)
+        if isinstance(value, (int, float)):
+            lines.append(f"- {labels.get(key, key)}: {_format_metric_human(key, value, currency)}")
+    return "\n".join(lines) if lines else "- No reliable KPI values were extracted."
+
+
+def _build_analysis_constraints(report_input: dict[str, Any]) -> str:
+    normalized = report_input.get("normalized_kpis", {})
+    constraints = [
+        "- Use only the KPI summary above.",
+        "- Treat revenue, operating income, and net income as flow metrics for the requested reporting period.",
+        "- Treat cash and total assets as end-of-period balance sheet metrics.",
+        "- Do not treat high cash balance by itself as a risk.",
+        "- Do not compare cash directly against total assets as a negative signal.",
+        "- Do not make leverage conclusions unless debt is explicitly present.",
+        "- Keep all KPI names in the JSON text in Russian when possible.",
+    ]
+    if not isinstance(normalized.get("debt"), (int, float)):
+        constraints.append("- Debt is not reliably extracted in this run, so leverage assessment must stay cautious.")
+    return "\n".join(constraints)
 
 
 async def serve() -> None:
