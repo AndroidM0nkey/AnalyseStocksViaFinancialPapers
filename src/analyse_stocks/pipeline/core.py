@@ -131,6 +131,21 @@ MULTIPLIERS = {
     "trillion": 1_000_000_000_000,
 }
 
+MONETARY_UNITS = {"RUB", "USD", "EUR"}
+MONETARY_KPIS = {
+    "revenue",
+    "gross_profit",
+    "operating_income",
+    "ebitda",
+    "net_income",
+    "total_assets",
+    "equity",
+    "cash",
+    "debt",
+    "operating_cash_flow",
+    "capex",
+}
+
 
 @dataclass
 class Candidate:
@@ -261,6 +276,57 @@ def normalize_scale_in_value_text(value_text: str) -> tuple[float | None, str | 
     if abs(final_value - round(final_value)) < 1e-9:
         final_value = int(round(final_value))
     return final_value, detect_unit(original), str(final_value)
+
+
+def extract_numeric_token(value_text: str) -> float | None:
+    if not value_text:
+        return None
+    normalized = value_text.lower().replace(" ", "").replace(",", ".").replace("\u2212", "-").replace("\u2013", "-")
+    match = re.search(r"-?\d+(?:\.\d+)?", normalized)
+    if not match:
+        return None
+    return float(match.group(0))
+
+
+def normalize_llm_value_by_candidate(
+    candidate: Candidate,
+    canonical_kpi: str | None,
+    value: float | None,
+    unit: str | None,
+) -> float | None:
+    if value is None or canonical_kpi not in MONETARY_KPIS or unit not in MONETARY_UNITS:
+        return value
+
+    source_scaled_value, source_unit, _ = normalize_scale_in_value_text(candidate.value_text)
+    source_raw_value = extract_numeric_token(candidate.value_text)
+    if source_scaled_value is None or source_raw_value is None:
+        return value
+    if source_unit and unit != source_unit:
+        return value
+
+    abs_value = abs(float(value))
+    abs_source_raw = abs(float(source_raw_value))
+    abs_source_scaled = abs(float(source_scaled_value))
+
+    if abs_source_scaled <= 0:
+        return value
+
+    raw_gap = abs(abs_value - abs_source_raw) / max(abs_source_raw, 1.0)
+    scaled_gap = abs(abs_value - abs_source_scaled) / max(abs_source_scaled, 1.0)
+
+    if raw_gap <= 0.03 and abs_source_scaled > abs_source_raw:
+        return float(source_scaled_value)
+    if scaled_gap <= 0.03:
+        return float(source_scaled_value)
+
+    scale_ratio = abs_source_scaled / max(abs_source_raw, 1.0)
+    if scale_ratio >= 1_000 and abs_value < abs_source_scaled / 1_000:
+        candidate_scaled_value = abs_value * scale_ratio
+        candidate_scaled_gap = abs(candidate_scaled_value - abs_source_scaled) / max(abs_source_scaled, 1.0)
+        if candidate_scaled_gap <= 0.10:
+            return float(source_scaled_value)
+
+    return value
 
 
 def pre_map_label_to_kpi(label_text: str) -> tuple[str | None, float]:
@@ -497,6 +563,20 @@ def safe_div(a: float | None, b: float | None) -> float | None:
     return a / b
 
 
+def find_kpi_consistency_issues(kpis: dict[str, Any]) -> list[str]:
+    issues: list[str] = []
+    revenue = kpis.get("revenue")
+    if isinstance(revenue, (int, float)) and revenue:
+        for name in ("net_income", "operating_income", "ebitda", "gross_profit"):
+            value = kpis.get(name)
+            if not isinstance(value, (int, float)):
+                continue
+            ratio = abs(value / revenue)
+            if ratio > 5:
+                issues.append(f"{name}_to_revenue={ratio:.2f}")
+    return issues
+
+
 def compute_derived_metrics(kpis: dict[str, Any]) -> dict[str, Any]:
     revenue = kpis.get("revenue")
     ebitda = kpis.get("ebitda")
@@ -512,4 +592,11 @@ def compute_derived_metrics(kpis: dict[str, Any]) -> dict[str, Any]:
         "debt_to_equity": safe_div(debt, equity),
         "cash_to_debt": safe_div(cash, debt),
     }
-    return {key: value for key, value in derived.items() if value is not None}
+    sane: dict[str, Any] = {}
+    for key, value in derived.items():
+        if value is None:
+            continue
+        if key.endswith("_margin") and abs(value) > 5:
+            continue
+        sane[key] = value
+    return sane

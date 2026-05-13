@@ -4,6 +4,7 @@ import asyncio
 from dataclasses import asdict
 import json
 import logging
+import re
 from typing import Any
 
 import grpc
@@ -23,6 +24,8 @@ from analyse_stocks.pipeline.core import (
     compute_derived_metrics,
     consolidate_kpis,
     extract_json,
+    find_kpi_consistency_issues,
+    normalize_llm_value_by_candidate,
     normalize_candidate_with_dictionary,
 )
 
@@ -63,9 +66,6 @@ Rules:
 6. Ignore boilerplate, page numbers, regulatory metadata, and non-financial counters.
 7. Prefer the simplest correct mapping.
 
-Candidate:
-{candidate_json}
-
 Return one valid JSON object only.
 Allowed values for "canonical_kpi":
 {canonical_kpis}
@@ -81,6 +81,9 @@ Use exactly this JSON shape:
   "confidence": 0.0,
   "reason": ""
 }}
+
+Candidate fields:
+{candidate_text}
 """.strip()
 
 
@@ -170,6 +173,23 @@ Return one valid JSON object only with exactly these keys:
 """.strip()
 
 
+def _build_analytical_report_retry_prompt(report_input: dict[str, Any]) -> str:
+    return (
+        _build_analytical_report_prompt(report_input)
+        + "\n\nImportant: do not repeat the KPI dictionary in the response. "
+        + "Do not use keys such as revenue, cash, net_income, operating_income, total_assets at the top level. "
+        + "Use only the required report keys."
+    )
+
+
+def _build_market_decision_retry_prompt(report_input: dict[str, Any]) -> str:
+    return (
+        _build_market_decision_prompt(report_input)
+        + "\n\nImportant: do not repeat the KPI dictionary in the response. "
+        + "Top-level keys must be only: signal, confidence, expected_move, rationale."
+    )
+
+
 def _runtime_config(config) -> OllamaRuntimeConfig:
     return OllamaRuntimeConfig(
         base_url=config.ollama_base_url,
@@ -183,6 +203,53 @@ def _run_ollama_json(config, prompt: str, max_new_tokens: int) -> tuple[dict[str
     result = run_chat_json(_runtime_config(config), prompt, max_new_tokens=max_new_tokens)
     raw_response = result["raw_response"]
     return extract_json(raw_response), raw_response
+
+
+def _candidate_to_prompt_text(candidate: Candidate) -> str:
+    return "\n".join(
+        [
+            f"source_type: {candidate.source_type}",
+            f"page_num: {candidate.page_num}",
+            f"section_hint: {candidate.section_hint or ''}",
+            f"section_type: {candidate.section_type or ''}",
+            f"section_score: {candidate.section_score}",
+            f"label_text: {candidate.label_text}",
+            f"value_text: {candidate.value_text}",
+            f"normalized_value_text: {candidate.normalized_value_text or ''}",
+            f"extracted_period: {candidate.extracted_period or ''}",
+            f"pre_mapped_kpi: {candidate.pre_mapped_kpi or ''}",
+            f"pre_map_confidence: {candidate.pre_map_confidence}",
+            f"raw_text: {candidate.raw_text}",
+        ]
+    )
+
+
+def _candidate_has_meaningful_label(candidate: Candidate) -> bool:
+    label = candidate.label_text or ""
+    letters = re.findall(r"[A-Za-zА-Яа-яЁё]", label)
+    digits = re.findall(r"\d", label)
+    if len(letters) < 3:
+        return False
+    if len(letters) <= len(digits):
+        return False
+    return True
+
+
+def _should_skip_llm_candidate(candidate: Candidate) -> bool:
+    raw_blob = " ".join(
+        [
+            candidate.label_text or "",
+            candidate.value_text or "",
+            candidate.raw_text or "",
+        ]
+    )
+    if not _candidate_has_meaningful_label(candidate):
+        return True
+    if len(raw_blob) > 700:
+        return True
+    if re.fullmatch(r"[\d\s,.\-%()/]+", candidate.label_text or ""):
+        return True
+    return False
 
 
 def _payload_keys(payload: dict[str, Any] | None) -> list[str]:
@@ -235,6 +302,55 @@ Draft response:
 {raw_response}
     """.strip()
     return _run_ollama_json(config, repair_prompt, max_new_tokens=max_new_tokens)
+
+
+def _run_validated_json_with_retries(
+    config,
+    prompt_attempts: list[tuple[str, str, int]],
+    validator,
+) -> tuple[dict[str, Any] | None, str]:
+    last_payload: dict[str, Any] | None = None
+    last_raw = ""
+    for attempt_name, prompt, max_new_tokens in prompt_attempts:
+        payload, raw = _run_ollama_json(config, prompt, max_new_tokens=max_new_tokens)
+        logging.info("Validated JSON attempt=%s keys=%s", attempt_name, _payload_keys(payload))
+        last_payload, last_raw = payload, raw
+        if validator(payload):
+            return payload, raw
+    return last_payload, last_raw
+
+
+def _run_validated_json_with_repair(
+    config,
+    prompt_attempts: list[tuple[str, str, int]],
+    validator,
+    repair_target: str,
+    repair_tokens: int,
+    fallback_builder,
+    fallback_input: dict[str, Any],
+    log_prefix: str,
+) -> tuple[dict[str, Any], str]:
+    payload, raw = _run_validated_json_with_retries(config, prompt_attempts, validator)
+    logging.info("%s parsed keys: %s", log_prefix, _payload_keys(payload))
+    if validator(payload):
+        return payload, raw
+
+    logging.warning("%s JSON is invalid after prompt retries, attempting repair", log_prefix)
+    repaired_payload, repaired_raw = _repair_invalid_json(
+        config,
+        raw,
+        repair_target,
+        max_new_tokens=repair_tokens,
+    )
+    logging.info("%s repaired keys: %s", log_prefix, _payload_keys(repaired_payload))
+    if validator(repaired_payload):
+        logging.info("%s repair succeeded", log_prefix)
+        return repaired_payload, repaired_raw
+
+    logging.warning("%s repair failed, using deterministic fallback", log_prefix)
+    fallback_payload = fallback_builder(fallback_input)
+    logging.info("%s fallback keys: %s", log_prefix, _payload_keys(fallback_payload))
+    return fallback_payload, raw
 
 
 def _format_number(value: Any, currency: str | None = None) -> str:
@@ -334,15 +450,40 @@ def _build_fallback_market_decision(report_input: dict[str, Any]) -> dict[str, A
 def _llm_normalize_candidate(config, candidate: Candidate) -> tuple[NormalizedKPI | None, str]:
     prompt = NORMALIZATION_PROMPT.format(
         canonical_kpis=json.dumps(CANONICAL_KPIS, ensure_ascii=False),
-        candidate_json=json.dumps(asdict(candidate), ensure_ascii=False, indent=2),
+        candidate_text=_candidate_to_prompt_text(candidate),
     )
-    data, raw_response = _run_ollama_json(config, prompt, max_new_tokens=250)
+    strict_retry_prompt = (
+        prompt
+        + "\n\nImportant: do not copy candidate fields into the response. "
+        + "Return only the target JSON object with the seven required keys."
+    )
+    data, raw_response = _run_validated_json_with_retries(
+        config,
+        [
+            ("normalize_primary", prompt, 250),
+            ("normalize_retry", strict_retry_prompt, 220),
+        ],
+        lambda payload: isinstance(payload, dict)
+        and {"canonical_kpi", "value", "unit", "period", "is_kpi", "confidence", "reason"}.issubset(payload.keys()),
+    )
     if not data:
         return None, raw_response
+    normalized_value = data.get("value")
+    if normalized_value is not None:
+        try:
+            normalized_value = float(normalized_value)
+        except (TypeError, ValueError):
+            normalized_value = None
+    normalized_value = normalize_llm_value_by_candidate(
+        candidate,
+        data.get("canonical_kpi"),
+        normalized_value,
+        data.get("unit"),
+    )
     return (
         NormalizedKPI(
             canonical_kpi=data.get("canonical_kpi"),
-            value=data.get("value"),
+            value=normalized_value,
             unit=data.get("unit"),
             period=data.get("period") or candidate.extracted_period,
             is_kpi=bool(data.get("is_kpi", False)),
@@ -407,6 +548,14 @@ class KpiExtractionService(analysis_pb2_grpc.KpiExtractionServiceServicer):
                         dictionary_hits += 1
                         normalized_items.append(dict_result)
                         continue
+                    if _should_skip_llm_candidate(candidate):
+                        logging.info(
+                            "Skipping low-signal candidate for LLM label=%s page=%s",
+                            candidate.label_text[:120],
+                            candidate.page_num,
+                        )
+                        normalized_items.append(None)
+                        continue
                     llm_result, raw_response = _llm_normalize_candidate(self.config, candidate)
                     raw_llm_responses.append(raw_response)
                     if llm_result is not None:
@@ -447,6 +596,13 @@ class KpiExtractionService(analysis_pb2_grpc.KpiExtractionServiceServicer):
 
         normalized_kpis_list_dicts = consolidate_kpis([item for item in normalized_items if item is not None])
         normalized_kpis_dict = build_kpi_dict(normalized_kpis_list_dicts)
+        consistency_issues = find_kpi_consistency_issues(normalized_kpis_dict)
+        if consistency_issues:
+            logging.warning(
+                "Detected KPI consistency issues for document %s: %s",
+                request.document_id,
+                ", ".join(consistency_issues),
+            )
         derived_metrics = compute_derived_metrics(normalized_kpis_dict)
         normalized_kpis_list = [
             analysis_pb2.NormalizedKpi(
@@ -542,51 +698,32 @@ class KpiExtractionService(analysis_pb2_grpc.KpiExtractionServiceServicer):
             "derived_metrics": dict(request.derived_metrics),
         }
 
-        analytical_report, analytical_raw = _run_ollama_json(
+        analytical_report, analytical_raw = _run_validated_json_with_repair(
             self.config,
-            _build_analytical_report_prompt(report_input),
-            max_new_tokens=1400,
+            [
+                ("report_primary", _build_analytical_report_prompt(report_input), 1400),
+                ("report_retry", _build_analytical_report_retry_prompt(report_input), 900),
+            ],
+            _is_valid_analytical_report,
+            "analytical_report",
+            900,
+            _build_fallback_analytical_report,
+            report_input,
+            "Analytical report",
         )
-        logging.info("Analytical report parsed keys: %s", _payload_keys(analytical_report))
-        if not _is_valid_analytical_report(analytical_report):
-            logging.warning("Analytical report JSON is invalid, attempting repair")
-            repaired_report, repaired_raw = _repair_invalid_json(
-                self.config,
-                analytical_raw,
-                "analytical_report",
-                max_new_tokens=900,
-            )
-            logging.info("Analytical report repaired keys: %s", _payload_keys(repaired_report))
-            if _is_valid_analytical_report(repaired_report):
-                logging.info("Analytical report repair succeeded")
-                analytical_report, analytical_raw = repaired_report, repaired_raw
-            else:
-                logging.warning("Analytical report repair failed")
-                analytical_report = _build_fallback_analytical_report(report_input)
-                logging.info("Analytical report fallback keys: %s", _payload_keys(analytical_report))
-
-        market_decision, decision_raw = _run_ollama_json(
+        market_decision, decision_raw = _run_validated_json_with_repair(
             self.config,
-            _build_market_decision_prompt(report_input),
-            max_new_tokens=350,
+            [
+                ("decision_primary", _build_market_decision_prompt(report_input), 350),
+                ("decision_retry", _build_market_decision_retry_prompt(report_input), 280),
+            ],
+            _is_valid_market_decision,
+            "market_decision",
+            350,
+            _build_fallback_market_decision,
+            report_input,
+            "Market decision",
         )
-        logging.info("Market decision parsed keys: %s", _payload_keys(market_decision))
-        if not _is_valid_market_decision(market_decision):
-            logging.warning("Market decision JSON is invalid, attempting repair")
-            repaired_decision, repaired_decision_raw = _repair_invalid_json(
-                self.config,
-                decision_raw,
-                "market_decision",
-                max_new_tokens=350,
-            )
-            logging.info("Market decision repaired keys: %s", _payload_keys(repaired_decision))
-            if _is_valid_market_decision(repaired_decision):
-                logging.info("Market decision repair succeeded")
-                market_decision, decision_raw = repaired_decision, repaired_decision_raw
-            else:
-                logging.warning("Market decision repair failed")
-                market_decision = _build_fallback_market_decision(report_input)
-                logging.info("Market decision fallback keys: %s", _payload_keys(market_decision))
 
         return analysis_pb2.GenerateAnalyticalOutputsResponse(
             analytical_report=_to_struct(analytical_report),
